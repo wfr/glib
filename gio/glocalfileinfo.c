@@ -64,6 +64,11 @@
 #endif
 
 #include "thumbnail-verify.h"
+#ifdef HAVE_DBUS1
+#define FREEDESKTOP_THUMBNAILER
+#include <gio/gdbusproxy.h>
+#include <glib-object.h>
+#endif /* HAVE_DBUS1 */
 
 #ifdef G_OS_WIN32
 #include <windows.h>
@@ -100,6 +105,16 @@ struct ThumbMD5Context {
 	guint32 bits[2];
 	unsigned char in[64];
 };
+
+#ifdef FREEDESKTOP_THUMBNAILER
+typedef struct
+{
+    GMainLoop *mainloop;
+    guint32 handle;
+    gboolean success;
+    const char *error_message;
+} ThumbnailerState;
+#endif /* FREEDESKTOP_THUMBNAILER */
 
 #ifndef G_OS_WIN32
 
@@ -1277,16 +1292,148 @@ get_content_type (const char          *basename,
   
 }
 
+#ifdef FREEDESKTOP_THUMBNAILER
+static void
+thumbnailer_signal_cb (GDBusProxy *proxy,
+                       gchar      *sender_name,
+                       gchar      *signal_name,
+                       GVariant   *parameters,
+                       gpointer    thumbnailer_state)
+{
+  ThumbnailerState *state = (ThumbnailerState *) thumbnailer_state;
+  guint32 signal_handle;
+  const gchar **uris;
+  
+  // TODO: remove debug output
+  gchar *dump = g_variant_print(parameters, FALSE);
+  g_debug("thumbnailer_signal_cb (%p, %s, %s, %s, ...) -- state->handle=%d",
+          proxy,
+          sender_name,
+          signal_name,
+          dump,
+          state->handle);
+  g_free(dump);
+
+  if (g_strcmp0 (signal_name, "Error") == 0)
+    {
+      g_variant_get(parameters, "(uasis)", &signal_handle, NULL, NULL, &state->error_message);
+      if (signal_handle == state->handle)
+        {
+          state->success = FALSE;
+        }
+    }
+  else if (g_strcmp0 (signal_name, "Ready") == 0)
+    {
+      // https://wiki.gnome.org/DraftSpecs/ThumbnailerSpec#Thumbnails_are_ready_for_use
+      g_variant_get(parameters, "(u^as)", &signal_handle, &uris);
+      for (; *uris; uris++)
+        g_debug("thumbnailer_signal_cb (): got thumbnail for %s", *uris );
+      if (signal_handle == state->handle)
+        {
+          state->success = TRUE;
+        }
+    }
+  else if (g_strcmp0 (signal_name, "Finished") == 0)
+    {
+      g_main_loop_quit(state->mainloop);
+    }
+
+}
+
+static GMutex thumb_mutex;
+
+static gboolean
+generate_thumbnail(const char *uri, const char *mime_type)
+{
+  GDBusProxy *proxy;
+  ThumbnailerState *state;
+  GVariant *result = NULL;
+  GError *error = NULL;
+  const gchar *uris[2] = { uri, NULL };
+  const gchar *mime_types[2] = { mime_type, NULL };
+
+  state = g_new(ThumbnailerState, 1);
+  state->success = FALSE;
+  state->mainloop = g_main_loop_new (NULL, FALSE);
+  
+  g_mutex_lock(&thumb_mutex);
+  proxy = g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SESSION,
+                                         G_DBUS_PROXY_FLAGS_NONE,
+                                         NULL,
+                                         "org.freedesktop.thumbnails.Thumbnailer1",
+                                         "/org/freedesktop/thumbnails/Thumbnailer1",
+                                         "org.freedesktop.thumbnails.Thumbnailer1",
+                                         NULL,
+                                         &error);
+  if(!proxy)
+    {
+      g_warning("generate_thumbnail (): g_dbus_proxy_new_for_bus_sync failed");
+      g_free(state);
+      g_main_loop_unref(state->mainloop);
+      g_mutex_unlock(&thumb_mutex);
+      return FALSE;
+    }
+  else
+    {
+      g_debug("generate_thumbnail (): connected to D-Bus");
+    }
+ 
+  g_signal_connect (G_OBJECT (proxy), "g-signal",
+                    G_CALLBACK (thumbnailer_signal_cb), state);
+  result = g_dbus_proxy_call_sync (proxy,
+                                   "Queue",
+                                   g_variant_new("(^as^asssu)",
+                                                 uris,
+                                                 mime_types,
+                                                 "large",
+                                                 "default",
+                                                 0),
+                                   G_DBUS_CALL_FLAGS_NONE,
+                                   G_MAXINT, // timeout
+                                   NULL,
+                                   &error);
+  if(!result || error)
+    {
+      g_warning("generate_thumbnail (): g_dbus_proxy_call_sync() failed: %s", error->message);
+      g_mutex_unlock(&thumb_mutex);
+      g_free(state);
+      return FALSE;
+    }
+  g_variant_get(result, "(u)", &(state->handle));
+  g_variant_unref(result);
+  // This blocks until the loop is terminated in the D-Bus callback:
+  g_main_loop_run(state->mainloop);
+  g_main_loop_unref(state->mainloop);
+  g_object_unref(proxy);
+
+  g_mutex_unlock(&thumb_mutex);
+
+  if(state->success)
+    {
+      g_debug("generate_thumbnail (): Thumbnail generated for %s", uri);
+      g_free(state);
+      return TRUE;
+    }
+  else
+    {
+      g_free(state);
+      return FALSE;
+    }
+}
+#endif /* FREEDESKTOP_THUMBNAILER */
+
 /* @stat_buf is the pre-calculated result of stat(path), or %NULL if that failed. */
 static void
 get_thumbnail_attributes (const char     *path,
                           GFileInfo      *info,
-                          const GLocalFileStat *stat_buf)
+                          const GLocalFileStat *stat_buf,
+                          gboolean        generate)
 {
   GChecksum *checksum;
   char *uri;
   char *filename;
   char *basename;
+  const char *content_type;
 
   uri = g_filename_to_uri (path, NULL, NULL);
 
@@ -1305,7 +1452,8 @@ get_thumbnail_attributes (const char     *path,
       _g_file_info_set_attribute_byte_string_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH, filename);
       _g_file_info_set_attribute_boolean_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAIL_IS_VALID,
                                                 thumbnail_verify (filename, uri, stat_buf));
-    }
+      generate = FALSE;
+   }
   else
     {
       g_free (filename);
@@ -1318,6 +1466,7 @@ get_thumbnail_attributes (const char     *path,
           _g_file_info_set_attribute_byte_string_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH, filename);
           _g_file_info_set_attribute_boolean_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAIL_IS_VALID,
                                                     thumbnail_verify (filename, uri, stat_buf));
+          generate = FALSE;
         }
       else
         {
@@ -1333,9 +1482,32 @@ get_thumbnail_attributes (const char     *path,
               _g_file_info_set_attribute_boolean_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAILING_FAILED, TRUE);
               _g_file_info_set_attribute_boolean_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAIL_IS_VALID,
                                                         thumbnail_verify (filename, uri, stat_buf));
+              generate = FALSE;
             }
         }
     }
+  
+#ifdef FREEDESKTOP_THUMBNAILER
+  if(generate)
+    {
+      content_type = g_file_info_get_content_type(info);
+      if(content_type)
+        {
+          g_debug("invoking Freedesktop Thumbnailer for %s (%s)", uri, content_type);
+          if(generate_thumbnail (uri, content_type))
+            {
+              /* Now that the thumbnail is generated, find it. */
+              get_thumbnail_attributes (path, info, stat_buf, FALSE);
+            }
+          else
+            {
+              _g_file_info_set_attribute_boolean_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAILING_FAILED, TRUE);
+              _g_file_info_set_attribute_boolean_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAIL_IS_VALID, FALSE);
+            }
+         }
+    }
+#endif /* FREEDESKTOP_THUMBNAILER */
+
   g_free (basename);
   g_free (filename);
   g_free (uri);
@@ -1695,6 +1867,17 @@ _g_local_file_info_get (const char             *basename,
 
   info = g_file_info_new ();
 
+  /* Thumbnail generation requires a content-type.
+   * TODO: consider implementing g_file_attribute_matcher_add() in gfileinfo.c */
+  if(_g_file_attribute_matcher_matches_id(attribute_matcher, G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH)
+     && !_g_file_attribute_matcher_matches_id(attribute_matcher, G_FILE_ATTRIBUTE_ID_STANDARD_CONTENT_TYPE)) {
+      char *attributes = g_file_attribute_matcher_to_string(attribute_matcher);
+      char *_attributes = g_strdup_printf("%s,standard::content-type", attributes);
+      attribute_matcher = g_file_attribute_matcher_new (_attributes);
+      g_free(attributes);
+      g_free(_attributes);
+    }
+  
   /* Make sure we don't set any unwanted attributes */
   g_file_info_set_attribute_mask (info, attribute_matcher);
   
@@ -1835,7 +2018,9 @@ _g_local_file_info_get (const char             *basename,
       _g_file_attribute_matcher_matches_id (attribute_matcher,
 					    G_FILE_ATTRIBUTE_ID_STANDARD_ICON) ||
       _g_file_attribute_matcher_matches_id (attribute_matcher,
-					    G_FILE_ATTRIBUTE_ID_STANDARD_SYMBOLIC_ICON))
+					    G_FILE_ATTRIBUTE_ID_STANDARD_SYMBOLIC_ICON) ||
+      _g_file_attribute_matcher_matches_id (attribute_matcher,
+                        G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH))
     {
       char *content_type = get_content_type (basename, path, stat_ok ? &statbuf : NULL, is_symlink, symlink_broken, flags, FALSE);
 
@@ -1948,9 +2133,9 @@ _g_local_file_info_get (const char             *basename,
 					    G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH))
     {
       if (stat_ok)
-          get_thumbnail_attributes (path, info, &statbuf);
+          get_thumbnail_attributes (path, info, &statbuf, TRUE);
       else
-          get_thumbnail_attributes (path, info, NULL);
+          get_thumbnail_attributes (path, info, NULL, TRUE);
     }
 
   vfs = g_vfs_get_default ();
