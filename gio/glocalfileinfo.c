@@ -66,6 +66,7 @@
 #include "thumbnail-verify.h"
 #ifdef HAVE_DBUS1
 #define FREEDESKTOP_THUMBNAILER
+#include <gio/gio.h>
 #include <gio/gdbusproxy.h>
 #include <glib-object.h>
 #endif /* HAVE_DBUS1 */
@@ -1303,83 +1304,72 @@ thumbnailer_signal_cb (GDBusProxy *proxy,
   ThumbnailerState *state = (ThumbnailerState *) thumbnailer_state;
   guint32 signal_handle;
   const gchar **uris;
-  
-  // TODO: remove debug output
-  gchar *dump = g_variant_print(parameters, FALSE);
-  g_debug("thumbnailer_signal_cb (%p, %s, %s, %s, ...) -- state->handle=%d",
-          proxy,
-          sender_name,
-          signal_name,
-          dump,
-          state->handle);
-  g_free(dump);
 
+  
   if (g_strcmp0 (signal_name, "Error") == 0)
     {
-      g_variant_get(parameters, "(uasis)", &signal_handle, NULL, NULL, &state->error_message);
-      if (signal_handle == state->handle)
-        {
-          state->success = FALSE;
-        }
+      g_variant_get (parameters, "(uasis)", &signal_handle, NULL, NULL, &state->error_message);
+      g_assert (signal_handle == state->handle);
+      state->success = FALSE;
     }
   else if (g_strcmp0 (signal_name, "Ready") == 0)
     {
-      // https://wiki.gnome.org/DraftSpecs/ThumbnailerSpec#Thumbnails_are_ready_for_use
-      g_variant_get(parameters, "(u^as)", &signal_handle, &uris);
-      for (; *uris; uris++)
-        g_debug("thumbnailer_signal_cb (): got thumbnail for %s", *uris );
-      if (signal_handle == state->handle)
-        {
-          state->success = TRUE;
-        }
+      g_variant_get (parameters, "(u^as)", &signal_handle, &uris);
+      g_assert (signal_handle == state->handle);
+      state->success = TRUE;
     }
   else if (g_strcmp0 (signal_name, "Finished") == 0)
     {
-      g_main_loop_quit(state->mainloop);
+      g_main_loop_quit (state->mainloop);
     }
 
 }
 
-static GMutex thumb_mutex;
-
 static gboolean
 generate_thumbnail(const char *uri, const char *mime_type)
 {
+  GMainContext *thread_context;
+  GDBusConnection *connection;
   GDBusProxy *proxy;
-  ThumbnailerState *state;
   GVariant *result = NULL;
   GError *error = NULL;
+  ThumbnailerState state;
   const gchar *uris[2] = { uri, NULL };
   const gchar *mime_types[2] = { mime_type, NULL };
-
-  state = g_new(ThumbnailerState, 1);
-  state->success = FALSE;
-  state->mainloop = g_main_loop_new (NULL, FALSE);
   
-  g_mutex_lock(&thumb_mutex);
-  proxy = g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SESSION,
-                                         G_DBUS_PROXY_FLAGS_NONE,
-                                         NULL,
-                                         "org.freedesktop.thumbnails.Thumbnailer1",
-                                         "/org/freedesktop/thumbnails/Thumbnailer1",
-                                         "org.freedesktop.thumbnails.Thumbnailer1",
-                                         NULL,
-                                         &error);
+  thread_context = g_main_context_new ();
+  state.mainloop = g_main_loop_new (thread_context, FALSE);
+  state.success = FALSE;
+  g_main_context_push_thread_default (thread_context);
+
+  connection = g_dbus_connection_new_for_address_sync (
+      g_dbus_address_get_for_bus_sync (G_BUS_TYPE_SESSION, NULL, NULL),
+      G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION | G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT,
+      NULL,
+      NULL,
+      &error);
+  g_assert_no_error (error);
+   
+  proxy = g_dbus_proxy_new_sync (connection,
+                                 G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+                                 NULL,
+                                 "org.freedesktop.thumbnails.Thumbnailer1",
+                                 "/org/freedesktop/thumbnails/Thumbnailer1",
+                                 "org.freedesktop.thumbnails.Thumbnailer1",
+                                 NULL, /* TODO: cancellable */
+                                 &error);
   if(!proxy)
     {
-      g_warning("generate_thumbnail (): g_dbus_proxy_new_for_bus_sync failed");
-      g_free(state);
-      g_main_loop_unref(state->mainloop);
-      g_mutex_unlock(&thumb_mutex);
+      g_warning ("generate_thumbnail (): g_dbus_proxy_new_sync failed");
+      g_main_loop_unref (state.mainloop);
       return FALSE;
     }
   else
-    {
-      g_debug("generate_thumbnail (): connected to D-Bus");
-    }
- 
+    g_debug("generate_thumbnail (): connected to D-Bus");
+  
   g_signal_connect (G_OBJECT (proxy), "g-signal",
-                    G_CALLBACK (thumbnailer_signal_cb), state);
+                    G_CALLBACK (thumbnailer_signal_cb), &state);
+  
   result = g_dbus_proxy_call_sync (proxy,
                                    "Queue",
                                    g_variant_new("(^as^asssu)",
@@ -1389,36 +1379,30 @@ generate_thumbnail(const char *uri, const char *mime_type)
                                                  "default",
                                                  0),
                                    G_DBUS_CALL_FLAGS_NONE,
-                                   G_MAXINT, // timeout
+                                   -1,
                                    NULL,
                                    &error);
   if(!result || error)
     {
-      g_warning("generate_thumbnail (): g_dbus_proxy_call_sync() failed: %s", error->message);
-      g_mutex_unlock(&thumb_mutex);
-      g_free(state);
+      g_warning ("generate_thumbnail (): g_dbus_proxy_call_sync() failed: %s", error->message);
       return FALSE;
     }
-  g_variant_get(result, "(u)", &(state->handle));
-  g_variant_unref(result);
-  // This blocks until the loop is terminated in the D-Bus callback:
-  g_main_loop_run(state->mainloop);
-  g_main_loop_unref(state->mainloop);
-  g_object_unref(proxy);
+  g_variant_get (result, "(u)", &(state.handle));
+  g_variant_unref (result);
+  // block until the loop is terminated in thumbnailer_signal_cb ()
+  g_main_loop_run (state.mainloop);
+  g_object_unref (proxy);
+  g_object_unref (connection);
+  g_main_loop_unref (state.mainloop);
+  g_main_context_unref (thread_context);
 
-  g_mutex_unlock(&thumb_mutex);
-
-  if(state->success)
+  if (state.success)
     {
-      g_debug("generate_thumbnail (): Thumbnail generated for %s", uri);
-      g_free(state);
+      g_debug ("generate_thumbnail (): Thumbnail generated for %s", uris[0]);
       return TRUE;
     }
   else
-    {
-      g_free(state);
-      return FALSE;
-    }
+    return FALSE;
 }
 #endif /* FREEDESKTOP_THUMBNAILER */
 
@@ -1487,13 +1471,13 @@ get_thumbnail_attributes (const char     *path,
         }
     }
   
-#ifdef FREEDESKTOP_THUMBNAILER
-  if(generate)
+  if (generate)
     {
-      content_type = g_file_info_get_content_type(info);
-      if(content_type)
+#ifdef FREEDESKTOP_THUMBNAILER
+      content_type = g_file_info_get_content_type (info);
+      if (content_type)
         {
-          g_debug("invoking Freedesktop Thumbnailer for %s (%s)", uri, content_type);
+          g_debug ("invoking Freedesktop Thumbnailer for %s (%s)", uri, content_type);
           if(generate_thumbnail (uri, content_type))
             {
               /* Now that the thumbnail is generated, find it. */
@@ -1505,8 +1489,8 @@ get_thumbnail_attributes (const char     *path,
               _g_file_info_set_attribute_boolean_by_id (info, G_FILE_ATTRIBUTE_ID_THUMBNAIL_IS_VALID, FALSE);
             }
          }
-    }
 #endif /* FREEDESKTOP_THUMBNAILER */
+    }
 
   g_free (basename);
   g_free (filename);
