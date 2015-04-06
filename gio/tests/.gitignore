@@ -5,6 +5,7 @@ appmonitor
 apps
 async-close-output-stream
 async-splice-output-stream
+autoptr
 basic-application
 buffered-input-stream
 buffered-output-stream
@@ -100,6 +101,7 @@ monitor
 network-address
 network-monitor
 org.gtk.test.enums.xml
+org.gtk.test.gschema.xml
 permission
 pollable
 plugin_resources.c
@@ -133,6 +135,7 @@ unix-fd
 unix-streams
 vfs
 volumemonitor
+xdgconfighome
 xdgdatadir
 xdgdatahome
 xgen-gio
