@@ -1852,14 +1852,15 @@ _g_local_file_info_get (const char             *basename,
   info = g_file_info_new ();
 
   /* Thumbnail generation requires a content-type.
-   * TODO: consider implementing g_file_attribute_matcher_add() in gfileinfo.c */
-  if(_g_file_attribute_matcher_matches_id(attribute_matcher, G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH)
-     && !_g_file_attribute_matcher_matches_id(attribute_matcher, G_FILE_ATTRIBUTE_ID_STANDARD_CONTENT_TYPE)) {
-      char *attributes = g_file_attribute_matcher_to_string(attribute_matcher);
-      char *_attributes = g_strdup_printf("%s,standard::content-type", attributes);
+   * TODO: implement g_file_attribute_matcher_add () in gfileinfo.c */
+  if (_g_file_attribute_matcher_matches_id (attribute_matcher, G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH)
+      && !_g_file_attribute_matcher_matches_id (attribute_matcher, G_FILE_ATTRIBUTE_ID_STANDARD_CONTENT_TYPE))
+    {
+      char *attributes = g_file_attribute_matcher_to_string (attribute_matcher);
+      char *_attributes = g_strdup_printf ("%s,standard::content-type", attributes);
       attribute_matcher = g_file_attribute_matcher_new (_attributes);
-      g_free(attributes);
-      g_free(_attributes);
+      g_free (attributes);
+      g_free (_attributes);
     }
   
   /* Make sure we don't set any unwanted attributes */
@@ -2004,7 +2005,7 @@ _g_local_file_info_get (const char             *basename,
       _g_file_attribute_matcher_matches_id (attribute_matcher,
 					    G_FILE_ATTRIBUTE_ID_STANDARD_SYMBOLIC_ICON) ||
       _g_file_attribute_matcher_matches_id (attribute_matcher,
-                        G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH))
+              G_FILE_ATTRIBUTE_ID_THUMBNAIL_PATH))
     {
       char *content_type = get_content_type (basename, path, stat_ok ? &statbuf : NULL, is_symlink, symlink_broken, flags, FALSE);
 
